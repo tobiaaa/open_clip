@@ -93,7 +93,6 @@ class CoCa(nn.Module):
         multimodal_cfg = MultimodalCfg(**multimodal_cfg) if isinstance(multimodal_cfg, dict) else multimodal_cfg
         text_cfg = CLIPTextCfg(**text_cfg) if isinstance(text_cfg, dict) else text_cfg
         vision_cfg = CLIPVisionCfg(**vision_cfg) if isinstance(vision_cfg, dict) else vision_cfg
-
         self.text = _build_text_tower(
             embed_dim=embed_dim,
             text_cfg=text_cfg,
@@ -261,6 +260,7 @@ class CoCa(nn.Module):
             image_latent, image_embs = self._encode_image(image)
 
             if text is None:
+                print(image.shape[0])
                 text = torch.ones((image.shape[0], 1), device=device, dtype=torch.long) * sot_token_id
 
             was_training = self.training
@@ -306,6 +306,104 @@ class CoCa(nn.Module):
 
             self.train(was_training)
             return out
+
+    def generate_from_embedding(
+        self,
+        img_latent,
+        img_embedding,
+        txt_embedding=None,
+        seq_len=30,
+        max_seq_len=77,
+        temperature=1.,
+        generation_type="top_k",
+        top_p=0.1,  # keep tokens in the 1 - top_p quantile
+        top_k=1,  # keeps the top_k most probable tokens
+        pad_token_id=None,
+        eos_token_id=None,
+        sot_token_id=None,
+        min_seq_len=5,
+        stopping_criteria=None,
+        repetition_penalty=1.0,
+        device=torch.device('cuda')
+    ):
+        # taking many ideas and components from HuggingFace GenerationMixin
+        # https://huggingface.co/docs/transformers/main/en/main_classes/text_generation
+        assert _has_transformers, "Please install transformers for generate functionality. `pip install transformers`."
+        assert seq_len > min_seq_len, "seq_len must be larger than min_seq_len"
+
+        with torch.no_grad():
+            sot_token_id = 49406 if sot_token_id is None else sot_token_id
+            eos_token_id = 49407 if eos_token_id is None else eos_token_id
+            pad_token_id = self.pad_id if pad_token_id is None else pad_token_id
+            logit_processor = LogitsProcessorList(
+                [
+                    MinLengthLogitsProcessor(min_seq_len, eos_token_id),
+                    RepetitionPenaltyLogitsProcessor(repetition_penalty),
+                ]
+            )
+
+            if stopping_criteria is None:
+                stopping_criteria = [MaxLengthCriteria(max_length=seq_len)]
+
+            stopping_criteria = StoppingCriteriaList(
+                stopping_criteria
+            )
+            if generation_type == "top_p":
+                logit_warper = GENERATION_TYPES[generation_type](top_p)
+            elif generation_type == "top_k":
+                logit_warper = GENERATION_TYPES[generation_type](top_k)
+            else:
+                raise ValueError(
+                    f"generation_type has to be one of "
+                    f"{'| ' + ' | '.join(list(GENERATION_TYPES.keys())) + ' |'}."
+                )
+
+            text = torch.ones((img_latent.shape[0], 1), device=device, dtype=torch.long) * sot_token_id
+
+            num_dims = len(text.shape)
+
+            if num_dims == 1:
+                text = text[None, :]
+
+            cur_len = text.shape[1]
+            self.eval()
+            out = text
+
+            while True:
+                x = out[:, -max_seq_len:]
+                cur_len = x.shape[1]
+                _, txt_embedding = self._encode_text(x)
+                logits = self.text_decoder(img_embedding, txt_embedding)[:, -1]
+                mask = (out[:, -1] == eos_token_id) | (out[:, -1] == pad_token_id)
+                sample = torch.ones((out.shape[0], 1), device=device, dtype=torch.long) * pad_token_id
+
+                if mask.all():
+                    break
+                else:
+                    logits = logits[~mask, :]
+                    filtered_logits = logit_processor(x[~mask, :], logits)
+                    filtered_logits = logit_warper(x[~mask, :], filtered_logits)
+                    probs = F.softmax(filtered_logits / temperature, dim=-1)
+
+                    if (cur_len + 1 == seq_len):
+                        sample[~mask, :] = torch.ones((sum(~mask), 1), device=device, dtype=torch.long) * eos_token_id
+                    else:
+                        sample[~mask, :] = torch.multinomial(probs, 1)
+
+                out = torch.cat((out, sample), dim=-1)
+
+                cur_len += 1
+
+                if stopping_criteria(out, None):
+                    break
+
+            if num_dims == 1:
+                out = out.squeeze(0)
+
+            return out
+            
+
+
 
     def _generate_beamsearch(
             self,
